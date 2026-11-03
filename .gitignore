@@ -2,6 +2,13 @@
 tunnels.json
 tunnels.json.tmp
 tunnels.json.bak.*
+runtime.json
+runtime.json.tmp
+logs/
+*.log
+.env
+.env.*
+.inspire/
 
 # 历史数据目录（早期版本会创建在这里）
 data/

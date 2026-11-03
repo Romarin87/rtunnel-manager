@@ -1,0 +1,21 @@
+.inspire-modal { border-radius: 8px; }
+.inspire-modal select {
+  width: 100%; min-width: 0; padding: 8px; border: 1px solid var(--border);
+  border-radius: 6px; background: var(--surface); color: var(--text); font: inherit;
+}
+.inspire-modal select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+.inspire-modal .field, .inspire-modal .form-grid { min-width: 0; }
+.inspire-modal option { padding: 7px 5px; }
+#inspire-notebook { height: 196px; }
+.inspire-search { display: flex; gap: 8px; margin-bottom: 12px; }
+.inspire-search input { min-width: 0; }
+#inspire-detail { min-height: 20px; font-size: 12px; color: var(--text-muted); overflow-wrap: anywhere; }
+#inspire-progress { margin-top: 16px; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+#inspire-error { color: var(--danger); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; max-height: 150px; overflow: auto; }
+@media (max-width: 560px) {
+  .topbar .brand h1 { display: none; }
+  .topbar-actions { gap: 3px; }
+  .topbar-actions .btn-sm { padding-left: 7px; padding-right: 7px; }
+  #modal-inspire { padding: 12px; }
+  .inspire-modal { max-height: 94vh; }
+}

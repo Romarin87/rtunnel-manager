@@ -34,10 +34,11 @@ const { spawn, execFile } = require('child_process');
 // 允许通过 RT_SHARED_CONFIG 显式指定一个可写位置（Electron 主进程会设置它），
 // CLI 模式下保持原行为：与 server.js 同目录（这样跟着 iCloud / Dropbox 同步走）。
 const SHARED_CONFIG = process.env.RT_SHARED_CONFIG || path.join(__dirname, 'tunnels.json');
-const DATA_DIR = path.join(os.homedir(), 'Library', 'Application Support', 'rtunnel-manager');
+const DATA_DIR = process.env.RT_DATA_DIR || path.join(os.homedir(), 'Library', 'Application Support', 'rtunnel-manager');
 const LOG_DIR = path.join(DATA_DIR, 'logs');
 const RUNTIME_FILE = path.join(DATA_DIR, 'runtime.json');
 const WEB_PORT = parseInt(process.env.RT_MANAGER_PORT || '7070', 10);
+const inspire = require('./inspire').createInspire({ managerPort: WEB_PORT, loadTunnels: () => reconcile(loadTunnels()) });
 
 // 历史数据目录，按"新→旧"顺序尝试一次性迁移；命中第一个含 tunnels.json 的就用它。
 // 老格式是单文件 [{ id, name, url, port, user, args, pid, status, startedAt }, ...]，
@@ -1299,6 +1300,28 @@ const server = http.createServer(async (req, res) => {
   const method = req.method;
 
   try {
+    if (pathname.startsWith('/api/inspire/')) {
+      if (![ `127.0.0.1:${WEB_PORT}`, `localhost:${WEB_PORT}` ].includes(req.headers.host)) {
+        return sendJson(res, 403, { error: '请求主机不匹配' });
+      }
+      const origin = req.headers.origin;
+      if (origin && origin !== `http://127.0.0.1:${WEB_PORT}` && origin !== `http://localhost:${WEB_PORT}`) {
+        return sendJson(res, 403, { error: '请求来源不匹配' });
+      }
+      if (method === 'GET' && pathname === '/api/inspire/accounts') return sendJson(res, 200, await inspire.accounts());
+      if (method === 'GET' && pathname === '/api/inspire/workspaces') return sendJson(res, 200, await inspire.workspaces(u.searchParams.get('account')));
+      if (method === 'GET' && pathname === '/api/inspire/notebooks') return sendJson(res, 200, await inspire.notebooks(u.searchParams.get('account'), u.searchParams.get('workspace')));
+      if (method === 'GET' && pathname === '/api/inspire/status') return sendJson(res, 200, inspire.status());
+      if (method === 'POST' && pathname === '/api/inspire/connect') {
+        if (!String(req.headers['content-type']).startsWith('application/json')) return sendJson(res, 415, { error: '需要 JSON 请求' });
+        return sendJson(res, 202, await inspire.connect(await readBody(req)));
+      }
+    }
+    if (method === 'GET' && ['/inspire-ui.js', '/inspire-ui.css'].includes(pathname)) {
+      res.writeHead(200, { 'Content-Type': pathname.endsWith('.js') ? 'application/javascript; charset=utf-8' : 'text/css; charset=utf-8' });
+      res.end(fs.readFileSync(path.join(__dirname, pathname.slice(1))));
+      return;
+    }
     if (method === 'GET' && pathname === '/') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(HTML_PAGE);
@@ -1517,6 +1540,7 @@ const HTML_PAGE = `<!DOCTYPE html>
 <meta name="author" content="SII-ljh">
 <meta name="generator" content="rtunnel-manager · ljh">
 <title>rtunnel 管理器</title>
+<link rel="stylesheet" href="/inspire-ui.css">
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%23eef1fb'/><text x='32' y='43' text-anchor='middle' font-family='-apple-system,Segoe UI,sans-serif' font-size='26' font-weight='700' fill='%234f6bed'>RT</text></svg>">
 <!-- crafted by SII-ljh · https://github.com/SII-ljh -->
 <style>
@@ -1740,7 +1764,7 @@ const HTML_PAGE = `<!DOCTYPE html>
     border-collapse: separate;
     border-spacing: 0;
     font-size: 13px;
-    min-width: 760px;
+    table-layout: fixed;
   }
   table.data th {
     text-align: left;
@@ -1767,17 +1791,18 @@ const HTML_PAGE = `<!DOCTYPE html>
   table.data tbody tr.detail-row > td {
     background: var(--surface-2);
     padding: 14px 18px;
+    height: auto;
     border-bottom: 1px solid var(--border);
   }
-  table.data .col-chevron { width: 24px; padding-left: 14px; padding-right: 0; }
-  table.data .col-name { font-weight: 600; color: var(--text); white-space: nowrap; min-width: 140px; }
-  table.data .col-url { color: var(--text-muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; max-width: 220px; width: 220px; }
+  table.data .col-chevron { width: 32px; padding-left: 14px; padding-right: 0; }
+  table.data td.col-name { font-weight: 600; color: var(--text); }
+  table.data .col-url { color: var(--text-muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; width: 14%; }
   table.data .col-url .url-text { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  table.data .col-ssh { white-space: nowrap; }
-  table.data .col-gpu { min-width: 180px; }
-  table.data .col-pid { color: var(--text-subtle); font-variant-numeric: tabular-nums; font-size: 12px; width: 60px; }
-  table.data .col-actions { text-align: right; white-space: nowrap; width: 1%; }
-  table.data .col-actions .btn { margin-left: 3px; }
+  table.data .col-ssh { white-space: nowrap; width: 24%; }
+  table.data .col-gpu { width: 16%; }
+  table.data .col-pid { color: var(--text-subtle); font-variant-numeric: tabular-nums; font-size: 12px; width: 68px; }
+  table.data .col-actions { text-align: right; width: 228px; }
+  .row-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 3px; }
 
   /* 状态徽标 */
   .pill {
@@ -1792,7 +1817,9 @@ const HTML_PAGE = `<!DOCTYPE html>
   .pill.unreachable { background: var(--danger-soft); color: var(--danger); border-color: transparent; cursor: help; }
   .pill.stopped { background: var(--surface-2); color: var(--text-muted); }
 
-  .name-cell { display: inline-flex; align-items: center; gap: 8px; }
+  .name-cell { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; min-width: 0; }
+  .name-text { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .name-cell .pill { flex-shrink: 0; white-space: nowrap; }
 
   /* 展开 chevron */
   .chev {
@@ -1810,6 +1837,7 @@ const HTML_PAGE = `<!DOCTYPE html>
   /* SSH 复制 chip */
   .ssh-chip {
     display: inline-flex; align-items: center; gap: 6px;
+    max-width: 100%;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 11.5px;
     background: var(--surface-2);
@@ -1825,13 +1853,14 @@ const HTML_PAGE = `<!DOCTYPE html>
   .ssh-chip.ready { background: var(--accent-soft); border-color: var(--accent-border); color: var(--accent); }
   .ssh-chip.disabled { opacity: 0.5; cursor: not-allowed; }
   .ssh-chip.disabled:hover { background: var(--surface-2); border-color: var(--border); color: var(--text-muted); }
-  .ssh-chip .copy-hint { font-size: 10.5px; color: var(--text-subtle); font-family: inherit; }
+  .ssh-command { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .ssh-chip .copy-hint { flex-shrink: 0; font-size: 10.5px; color: var(--text-subtle); font-family: inherit; }
   .ssh-chip:hover .copy-hint, .ssh-chip.ready .copy-hint { color: inherit; opacity: 0.75; }
 
   /* GPU 概要 */
   .gpu-info { display: inline-flex; align-items: center; gap: 10px; font-size: 12px; color: var(--text-muted); flex-wrap: wrap; }
-  .gpu-info .gpu-model { color: var(--text); font-weight: 500; }
-  .gpu-info .metric-inline { display: inline-flex; align-items: center; gap: 5px; font-variant-numeric: tabular-nums; }
+  .gpu-info .gpu-model { color: var(--text); font-weight: 500; overflow-wrap: anywhere; }
+  .gpu-info .metric-inline { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 5px; font-variant-numeric: tabular-nums; }
   .gpu-info .metric-inline b { color: var(--text); font-weight: 500; }
   .gpu-info-dim { color: var(--text-subtle); font-size: 12px; }
 
@@ -1841,7 +1870,8 @@ const HTML_PAGE = `<!DOCTYPE html>
   .bar.hot > i { background: var(--danger); }
 
   /* 展开后的 GPU 明细 */
-  .detail-panel { display: flex; flex-direction: column; gap: 12px; }
+  .detail-panel { display: flex; flex-direction: column; gap: 12px; overflow-wrap: anywhere; }
+  .detail-body { overflow-x: auto; }
   .detail-meta {
     display: flex; flex-wrap: wrap; gap: 16px;
     font-size: 12px; color: var(--text-muted);
@@ -1993,9 +2023,20 @@ const HTML_PAGE = `<!DOCTYPE html>
   .signoff a { color: inherit; text-decoration: none; }
 
   /* ---------- 响应式 ---------- */
+  @media (max-width: 1100px) {
+    table.data .col-url { display: none; }
+    table.data th, table.data td { padding-left: 8px; padding-right: 8px; }
+    table.data .col-gpu { width: 20%; }
+  }
   @media (max-width: 960px) {
     .metrics { grid-template-columns: repeat(2, 1fr); }
     .topbar-stats { display: none; }
+  }
+  @media (max-width: 800px) {
+    table.data .col-pid { display: none; }
+    table.data .col-actions { width: 116px; }
+    table.data .col-ssh { width: 27%; }
+    table.data .col-gpu { width: 22%; }
   }
   @media (max-width: 720px) {
     .container { padding: 16px 12px 40px; }
@@ -2007,6 +2048,13 @@ const HTML_PAGE = `<!DOCTYPE html>
     .metrics { grid-template-columns: 1fr 1fr; gap: 8px; }
     .metric { padding: 12px 14px; }
     .metric .value { font-size: 18px; }
+    table.data, table.data tbody { display: block; }
+    table.data thead { display: none; }
+    table.data tr.data-row { display: grid; grid-template-columns: 32px minmax(0, 1fr); padding: 8px; border-bottom: 1px solid var(--border); }
+    table.data tr.data-row > td { width: auto; height: auto; border: 0; grid-column: 2; }
+    table.data tr.data-row > .col-chevron { grid-column: 1; grid-row: 1; }
+    table.data .detail-row, table.data .detail-row > td { display: block; }
+    .row-actions { justify-content: flex-start; }
   }
 </style>
 </head>
@@ -2018,6 +2066,7 @@ const HTML_PAGE = `<!DOCTYPE html>
   </div>
   <div class="topbar-stats" id="topbar-stats"></div>
   <div class="topbar-actions">
+    <button class="btn btn-primary btn-sm" id="open-inspire">连接 Notebook</button>
     <button class="btn btn-primary btn-sm" id="open-new">+ 新建隧道</button>
     <button class="btn btn-icon" id="theme-toggle" title="切换主题" aria-label="切换主题"></button>
     <button class="btn btn-ghost btn-sm" id="quit" title="关闭管理器（已运行的隧道不受影响）">退出</button>
@@ -2387,7 +2436,7 @@ function sshChipHtml(t) {
   const ready = running && t.reachable !== false;
   const cls = ready ? 'ssh-chip ready' : (running ? 'ssh-chip disabled' : 'ssh-chip disabled');
   const hint = ready ? '复制' : (running ? '不可达' : '未运行');
-  return \`<span class="\${cls}" data-cmd="\${esc(ssh)}" title="\${ready ? '点击复制 ssh 命令' : '隧道未运行或不可达'}">\${esc(ssh)}<span class="copy-hint">\${hint}</span></span>\`;
+  return \`<span class="\${cls}" data-cmd="\${esc(ssh)}" title="\${esc(ssh)} · \${ready ? '点击复制 ssh 命令' : '隧道未运行或不可达'}"><span class="ssh-command">\${esc(ssh)}</span><span class="copy-hint">\${hint}</span></span>\`;
 }
 
 function cpuDetailHtml(t) {
@@ -2452,23 +2501,23 @@ function detailRowHtml(t) {
   }
   return \`<div class="detail-panel">
     \${meta.length ? \`<div class="detail-meta">\${meta.join('')}</div>\` : ''}
-    \${body}
+    <div class="detail-body">\${body}</div>
   </div>\`;
 }
 
 function groupTableHtml(group) {
-  const cols = 7;
+  const cols = matchMedia('(max-width: 800px)').matches ? 5 : (matchMedia('(max-width: 1100px)').matches ? 6 : 7);
   const rows = group.items.map((t) => {
     const open = state.expanded.has(t.id);
     const detail = open ? \`<tr class="detail-row"><td colspan="\${cols}">\${detailRowHtml(t)}</td></tr>\` : '';
     return \`<tr class="data-row" data-id="\${t.id}">
       <td class="col-chevron"><button class="chev \${open ? 'open' : ''}" data-act="toggle" data-id="\${t.id}" aria-label="\${open ? '收起' : '展开'}">\${SVG_CHEV}</button></td>
-      <td class="col-name"><span class="name-cell">\${esc(t.name)} \${statusPill(t)}</span></td>
+      <td class="col-name"><span class="name-cell"><span class="name-text" title="\${esc(t.name)}">\${esc(t.name)}</span>\${statusPill(t)}</span></td>
       <td class="col-url"><span class="url-text" title="\${esc(t.url)}">\${esc(t.url)}</span></td>
       <td class="col-ssh">\${sshChipHtml(t)}</td>
       <td class="col-gpu">\${metricCellHtml(t)}</td>
       <td class="col-pid">\${t.pid ? esc(String(t.pid)) : '—'}</td>
-      <td class="col-actions">\${actionsHtml(t)}</td>
+      <td class="col-actions"><div class="row-actions">\${actionsHtml(t)}</div></td>
     </tr>\${detail}\`;
   }).join('');
   return \`<div class="group" data-status="\${group.key}">
@@ -2480,12 +2529,12 @@ function groupTableHtml(group) {
     <div class="table-wrap"><div class="table-scroll"><table class="data">
       <thead><tr>
         <th class="col-chevron"></th>
-        <th>名称</th>
-        <th>远程地址</th>
-        <th>SSH</th>
-        <th>资源使用</th>
-        <th>PID</th>
-        <th></th>
+        <th class="col-name">名称</th>
+        <th class="col-url">远程地址</th>
+        <th class="col-ssh">SSH</th>
+        <th class="col-gpu">资源使用</th>
+        <th class="col-pid">PID</th>
+        <th class="col-actions"></th>
       </tr></thead>
       <tbody>\${rows}</tbody>
     </table></div></div>
@@ -2506,6 +2555,11 @@ function render() {
     return;
   }
   root.innerHTML = groups.map(groupTableHtml).join('');
+}
+
+// Keep expanded rows aligned when responsive columns change visibility.
+for (const query of ['(max-width: 800px)', '(max-width: 1100px)']) {
+  matchMedia(query).addEventListener('change', render);
 }
 
 // ---------- 数据刷新 ----------
@@ -2782,6 +2836,7 @@ initTheme();
 refresh();
 const refreshTimer = setInterval(refresh, 3000);
 </script>
+<script src="/inspire-ui.js"></script>
 </body>
 </html>`;
 

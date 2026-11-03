@@ -1,0 +1,2 @@
+# External CLI used by the Notebook integration, installed separately from npm.
+inspire-skill>=7.1.14
