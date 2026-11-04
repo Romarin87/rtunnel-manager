@@ -89,7 +89,6 @@
       const data = await api('/api/inspire/workspaces?' + query());
       const spaces = data.workspaces || [];
       get('workspace').replaceChildren(...spaces.map(name => new Option(name, name)));
-      if (spaces.includes('CPU资源空间')) get('workspace').value = 'CPU资源空间';
       if (spaces.length) await loadNotebooks();
       else get('progress').textContent = '此账号没有可用工作空间';
     } catch (e) { error(e.message); }

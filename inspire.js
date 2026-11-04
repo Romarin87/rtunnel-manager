@@ -47,7 +47,7 @@ function createInspire({ managerPort, loadTunnels, run = runCLI,
     const data = await cli(['notebook', 'list', '--all', '--account', label(account, '账号'), '--workspace', label(workspace, '工作空间')]);
     const tunnels = loadTunnels();
     return { notebooks: (data.items || []).map(n => {
-      const existing = tunnels.find(t => t.name === `bw:${account}:${workspace}:${n.name}`);
+      const existing = tunnels.find(t => t.name === `inspire:${account}:${workspace}:${n.name}`);
       const restricted = restrictedNotebook(n);
       return { name: n.name, status: n.status, project: n.project, group: n.compute_group,
         restricted, localPort: existing?.port || null };
@@ -60,7 +60,7 @@ function createInspire({ managerPort, loadTunnels, run = runCLI,
       const account = label(body.account, '账号');
       const workspace = label(body.workspace, '工作空间');
       const notebook = label(body.notebook, 'Notebook');
-      const name = `bw:${account}:${workspace}:${notebook}`;
+      const name = `inspire:${account}:${workspace}:${notebook}`;
       const tunnels = loadTunnels();
       const matches = tunnels.filter(t => t.name === name);
       if (matches.length > 1) throw new Error('存在重名连接，请先在列表中整理');

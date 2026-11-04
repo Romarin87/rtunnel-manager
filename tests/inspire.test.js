@@ -51,6 +51,14 @@ test('healthy connection is reused and rotated URL updates same entry', async ()
     ['POST', '/api/tunnels/test/stop'], ['PUT', '/api/tunnels/test'], ['POST', '/api/tunnels/test/start'],
   ]);
 });
+test('connection names use the provider namespace and listing reuses the port', async () => {
+  const f = fixture(); await f.connect();
+  assert.equal(f.tunnels[0].name, 'inspire:a:w:box');
+  const listing = await f.service.notebooks('a', 'w');
+  assert.equal(listing.notebooks[0].localPort, f.body.localPort);
+  const otherAccount = await f.service.notebooks('other', 'w');
+  assert.equal(otherAccount.notebooks[0].localPort, null);
+});
 test('restricted Notebook cannot start SSH setup or mutate tunnels', async () => {
   const f = fixture({ group: 'H200' }); await f.connect();
   assert.equal(f.service.status().job.status, 'failed');
