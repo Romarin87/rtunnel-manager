@@ -38,7 +38,9 @@ const DATA_DIR = process.env.RT_DATA_DIR || path.join(os.homedir(), 'Library', '
 const LOG_DIR = path.join(DATA_DIR, 'logs');
 const RUNTIME_FILE = path.join(DATA_DIR, 'runtime.json');
 const WEB_PORT = parseInt(process.env.RT_MANAGER_PORT || '7070', 10);
-const inspire = require('./inspire').createInspire({ managerPort: WEB_PORT, loadTunnels: () => reconcile(loadTunnels()) });
+const { createInspire, normalizeBinding, notebookServiceKey, duplicateNotebookConnection } = require('./inspire');
+const inspire = createInspire({ managerPort: WEB_PORT, loadTunnels: () => reconcile(loadTunnels()) });
+const pendingTunnelStarts = new Set();
 
 // 历史数据目录，按"新→旧"顺序尝试一次性迁移；命中第一个含 tunnels.json 的就用它。
 // 老格式是单文件 [{ id, name, url, port, user, args, pid, status, startedAt }, ...]，
@@ -274,6 +276,7 @@ function loadTunnels() {
       useSudo: !!s.useSudo,
       skipDirectCheck: !!s.skipDirectCheck,
       monitorType: s.monitorType === 'cpu' ? 'cpu' : 'gpu',
+      inspire: s.inspire || null,
       pid: r.pid || null,
       status: r.status || 'stopped',
       startedAt: r.startedAt || null,
@@ -292,6 +295,7 @@ function saveTunnels(tunnels) {
     useSudo: !!t.useSudo,
     skipDirectCheck: !!t.skipDirectCheck,
     monitorType: t.monitorType === 'cpu' ? 'cpu' : 'gpu',
+    inspire: t.inspire || null,
   }));
   const runtime = {};
   for (const t of tunnels) {
@@ -1247,6 +1251,20 @@ function sendJson(res, code, obj) {
   res.end(body);
 }
 
+function recordTunnelRequest(req, action, t, result) {
+  const source = String(req.headers['x-rt-client'] || 'unspecified');
+  const entry = { time: new Date().toISOString(), action, tunnelId: t.id, port: t.port, result,
+    source: ['manager-ui', 'inspire-connection'].includes(source) ? source : 'external' };
+  try { fs.appendFileSync(path.join(LOG_DIR, 'manager-events.log'), JSON.stringify(entry) + '\n', { mode: 0o600 }); }
+  catch (_) { /* Diagnostics must not prevent tunnel operations. */ }
+}
+
+function rejectDuplicate(res, duplicate) {
+  return sendJson(res, 409, { code: 'DUPLICATE_NOTEBOOK_CONNECTION',
+    error: `此 Notebook 服务已有本地连接（端口 ${duplicate.port}），请复用该连接。`,
+    existingTunnelId: duplicate.id, existingPort: duplicate.port });
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let data = '';
@@ -1278,6 +1296,7 @@ function publicView(tunnels) {
       useSudo: !!t.useSudo,
       skipDirectCheck: !!t.skipDirectCheck,
       monitorType: t.monitorType === 'cpu' ? 'cpu' : 'gpu',
+      inspire: t.inspire || null,
       status: t.status,
       pid: t.pid || null,
       startedAt: t.startedAt || null,
@@ -1368,10 +1387,13 @@ const server = http.createServer(async (req, res) => {
         useSudo: !!body.useSudo,
         skipDirectCheck: !!body.skipDirectCheck,
         monitorType: body.monitorType === 'cpu' ? 'cpu' : 'gpu',
+        inspire: normalizeBinding(body.inspire),
         pid: null,
         status: 'stopped',
         startedAt: null,
       };
+      const duplicate = duplicateNotebookConnection(tunnels, t);
+      if (duplicate) return rejectDuplicate(res, duplicate);
       tunnels.push(t);
       saveTunnels(tunnels);
       sendJson(res, 200, { tunnel: publicView([t])[0] });
@@ -1383,8 +1405,8 @@ const server = http.createServer(async (req, res) => {
     if (m) {
       const id = m[1];
       const action = m[2];
-      const tunnels = reconcile(loadTunnels());
-      const t = tunnels.find((x) => x.id === id);
+      let tunnels = reconcile(loadTunnels());
+      let t = tunnels.find((x) => x.id === id);
       if (!t) return sendJson(res, 404, { error: '未找到该隧道' });
 
       if (method === 'DELETE') {
@@ -1406,6 +1428,7 @@ const server = http.createServer(async (req, res) => {
       // 只改配置，不动正在运行的进程——新配置在下次启动/重启时生效。
       if (method === 'PUT') {
         const body = await readBody(req);
+        const binding = body.inspire === undefined ? t.inspire : normalizeBinding(body.inspire);
         const url = (body.url || '').trim();
         const port = parseInt(body.port, 10);
         let rtunnelCommand;
@@ -1413,6 +1436,8 @@ const server = http.createServer(async (req, res) => {
         catch (e) { return sendJson(res, 400, { error: e.message }); }
         if (!url) return sendJson(res, 400, { error: 'url 不能为空' });
         if (!port || port < 1 || port > 65535) return sendJson(res, 400, { error: '端口无效（1-65535）' });
+        const duplicate = duplicateNotebookConnection(tunnels, { ...t, url, inspire: binding });
+        if (duplicate) return rejectDuplicate(res, duplicate);
         t.url = url;
         t.port = port;
         t.name = (body.name || '').trim() || `tunnel-${port}`;
@@ -1422,6 +1447,7 @@ const server = http.createServer(async (req, res) => {
         t.useSudo = !!body.useSudo;
         t.skipDirectCheck = !!body.skipDirectCheck;
         t.monitorType = body.monitorType === 'cpu' ? 'cpu' : 'gpu';
+        t.inspire = binding;
         // 监控类型改变时，清掉旧类型残留的内存指标，避免前端显示串台
         gpuStats.delete(t.id); cpuStats.delete(t.id);
         saveTunnels(tunnels);
@@ -1444,76 +1470,91 @@ const server = http.createServer(async (req, res) => {
 
       if (method === 'POST' && (action === 'start' || action === 'restart')) {
         const body = await readBody(req);
-        if (action === 'restart') {
-          const stopResult = await stopTunnel(t, { sudoPassword: body.sudoPassword });
-          saveTunnels(tunnels);
-          if (!stopResult.ok) {
-            return sendJson(res, stopResult.code === 'SUDO_REQUIRED' ? 403 : 409, {
-              code: stopResult.code,
-              error: stopResult.reason,
-              tunnel: publicView([t])[0],
-            });
-          }
+        tunnels = reconcile(loadTunnels());
+        t = tunnels.find(x => x.id === id);
+        if (!t) return sendJson(res, 404, { error: '未找到该隧道' });
+        const duplicate = duplicateNotebookConnection(tunnels, t);
+        if (duplicate) {
+          recordTunnelRequest(req, action, t, 'duplicate-blocked');
+          return rejectDuplicate(res, duplicate);
         }
-        if (t.status === 'running' && isAlive(t.pid)) {
-          return sendJson(res, 200, { tunnel: publicView([t])[0] });
-        }
-        const portInfo = await getPortOccupants(t.port, t);
-        if (portInfo.occupied) {
-          const portStop = classifyPortOccupants(t, portInfo);
-          if (!body.stopOccupiedPort) {
-            return sendJson(res, 409, {
-              code: 'PORT_IN_USE',
-              error: `本地端口 ${t.port} 已被占用（${describePortOccupants(portInfo)}）。${portStop.canStop ? '' : portStop.reason}`,
-              port: t.port,
-              canStopOccupiedPort: portStop.canStop,
-              processes: publicPortProcesses(portInfo),
-            });
-          }
-          if (!portStop.canStop) {
-            return sendJson(res, 409, {
-              code: 'PORT_IN_USE',
-              error: `本地端口 ${t.port} 已被占用（${describePortOccupants(portInfo)}）。${portStop.reason}`,
-              port: t.port,
-              canStopOccupiedPort: false,
-              processes: publicPortProcesses(portInfo),
-            });
-          }
-          const stopPortResult = await stopPortOccupants(t.port, {
-            tunnel: t,
-            sudoPassword: body.sudoPassword,
-            canStopProcess: (p) => isTunnelPortProcess(t, p),
-          });
-          if (!stopPortResult.ok) {
-            return sendJson(res, stopPortResult.code === 'SUDO_REQUIRED' ? 403 : 409, {
-              code: stopPortResult.code,
-              error: stopPortResult.reason,
-              port: t.port,
-              canStopOccupiedPort: stopPortResult.code === 'SUDO_REQUIRED',
-              processes: publicPortProcesses(stopPortResult.portInfo || portInfo),
-            });
-          }
-        }
-        if (!t.skipDirectCheck) {
-          const gate = await directConnectionGate(t.url);
-          if (!gate.ok) {
+        const startKey = notebookServiceKey(t.url) || id;
+        if (pendingTunnelStarts.has(startKey)) return sendJson(res, 409, { error: '该连接正在启动，请等待完成' });
+        pendingTunnelStarts.add(startKey);
+        recordTunnelRequest(req, action, t, 'requested');
+        try {
+          if (action === 'restart') {
+            const stopResult = await stopTunnel(t, { sudoPassword: body.sudoPassword });
             saveTunnels(tunnels);
-            return sendJson(res, 409, { error: `直连校验未通过：${gate.reason}` });
+            if (!stopResult.ok) {
+              return sendJson(res, stopResult.code === 'SUDO_REQUIRED' ? 403 : 409, {
+                code: stopResult.code,
+                error: stopResult.reason,
+                tunnel: publicView([t])[0],
+              });
+            }
           }
-        }
-        const result = await startTunnel(t, { sudoPassword: body.sudoPassword });
-        saveTunnels(tunnels);
-        if (!result.ok) return sendJson(res, 500, { error: result.reason });
-        // 启动门确认过远程网关可达时，乐观初始化为"运行中、可达"；
-        // 若用户跳过直连校验，则等待 2s 后的端到端 SSH 探测给出真实状态。
-        if (t.skipDirectCheck) health.delete(t.id);
-        else health.set(t.id, { reachable: true, checkedAt: new Date().toISOString(), reason: null });
-        setTimeout(() => { checkOne(t).catch(() => {}); }, 2000);
-        // 顺带查一次资源指标，前端展开时立刻有数据（不必等下一轮 15s 轮询）
-        setTimeout(() => {
-          (t.monitorType === 'cpu' ? queryCpu(t) : queryGpu(t)).catch(() => {});
-        }, 2000);
-        return sendJson(res, 200, { tunnel: publicView([t])[0] });
+          if (t.status === 'running' && isAlive(t.pid)) {
+            return sendJson(res, 200, { tunnel: publicView([t])[0] });
+          }
+          const portInfo = await getPortOccupants(t.port, t);
+          if (portInfo.occupied) {
+            const portStop = classifyPortOccupants(t, portInfo);
+            if (!body.stopOccupiedPort) {
+              return sendJson(res, 409, {
+                code: 'PORT_IN_USE',
+                error: `本地端口 ${t.port} 已被占用（${describePortOccupants(portInfo)}）。${portStop.canStop ? '' : portStop.reason}`,
+                port: t.port,
+                canStopOccupiedPort: portStop.canStop,
+                processes: publicPortProcesses(portInfo),
+              });
+            }
+            if (!portStop.canStop) {
+              return sendJson(res, 409, {
+                code: 'PORT_IN_USE',
+                error: `本地端口 ${t.port} 已被占用（${describePortOccupants(portInfo)}）。${portStop.reason}`,
+                port: t.port,
+                canStopOccupiedPort: false,
+                processes: publicPortProcesses(portInfo),
+              });
+            }
+            const stopPortResult = await stopPortOccupants(t.port, {
+              tunnel: t,
+              sudoPassword: body.sudoPassword,
+              canStopProcess: (p) => isTunnelPortProcess(t, p),
+            });
+            if (!stopPortResult.ok) {
+              return sendJson(res, stopPortResult.code === 'SUDO_REQUIRED' ? 403 : 409, {
+                code: stopPortResult.code,
+                error: stopPortResult.reason,
+                port: t.port,
+                canStopOccupiedPort: stopPortResult.code === 'SUDO_REQUIRED',
+                processes: publicPortProcesses(stopPortResult.portInfo || portInfo),
+              });
+            }
+          }
+          if (!t.skipDirectCheck) {
+            const gate = await directConnectionGate(t.url);
+            if (!gate.ok) {
+              saveTunnels(tunnels);
+              return sendJson(res, 409, { error: `直连校验未通过：${gate.reason}` });
+            }
+          }
+          const result = await startTunnel(t, { sudoPassword: body.sudoPassword });
+          recordTunnelRequest(req, action, t, result.ok ? 'started' : 'failed');
+          saveTunnels(tunnels);
+          if (!result.ok) return sendJson(res, 500, { error: result.reason });
+          // 启动门确认过远程网关可达时，乐观初始化为"运行中、可达"；
+          // 若用户跳过直连校验，则等待 2s 后的端到端 SSH 探测给出真实状态。
+          if (t.skipDirectCheck) health.delete(t.id);
+          else health.set(t.id, { reachable: true, checkedAt: new Date().toISOString(), reason: null });
+          setTimeout(() => { checkOne(t).catch(() => {}); }, 2000);
+          // 顺带查一次资源指标，前端展开时立刻有数据（不必等下一轮 15s 轮询）
+          setTimeout(() => {
+            (t.monitorType === 'cpu' ? queryCpu(t) : queryGpu(t)).catch(() => {});
+          }, 2000);
+          return sendJson(res, 200, { tunnel: publicView([t])[0] });
+        } finally { pendingTunnelStarts.delete(startKey); }
       }
     }
 
@@ -2229,7 +2270,7 @@ function toast(msg, isErr) {
   toastTimer = setTimeout(() => { el.className = ''; }, isErr ? 6000 : 2500);
 }
 async function api(url, opts) {
-  const res = await fetch(url, opts);
+  const res = await fetch(url, { ...opts, headers: { ...opts?.headers, 'X-RT-Client': 'manager-ui' } });
   let data = {};
   try { data = await res.json(); } catch (_) {}
   if (!res.ok) {

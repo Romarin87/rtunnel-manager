@@ -22,6 +22,7 @@
         </div>
         <div class="field"><label for="inspire-notebook">Notebook</label><select id="inspire-notebook" size="6"></select></div>
         <p id="inspire-detail"></p>
+        <div class="field"><label for="inspire-tunnel">已有本地连接</label><select id="inspire-tunnel"></select></div>
         <div class="field"><label for="inspire-port">本地端口</label><input type="number" min="1024" max="65535" id="inspire-port" placeholder="自动分配"></div>
         <div id="inspire-progress" role="status" aria-live="polite"></div>
         <pre id="inspire-error" role="alert" hidden></pre>
@@ -33,7 +34,7 @@
     </div>`;
   document.body.appendChild(modal);
   const get = id => document.getElementById('inspire-' + id);
-  let rows = [], loading = false, busy = false, generation = 0, job = null, timer = null;
+  let rows = [], tunnels = [], loading = false, busy = false, generation = 0, job = null, timer = null;
   let lastFocused = null;
   const statusNames = { RUNNING: '运行中', STOPPED: '已停止', PENDING: '排队中', CREATING: '创建中', STARTING: '启动中' };
   const allowed = ['RUNNING', 'STOPPED', 'PENDING', 'CREATING', 'STARTING'];
@@ -43,7 +44,7 @@
     get('error').hidden = !message;
   }
   function controls() {
-    for (const id of ['account', 'workspace', 'search', 'reload', 'notebook', 'port']) get(id).disabled = busy || loading;
+    for (const id of ['account', 'workspace', 'search', 'reload', 'notebook', 'tunnel', 'port']) get(id).disabled = busy || loading;
     const row = selection();
     get('connect').disabled = busy || loading || !row || row.restricted || !allowed.includes(row.status);
     get('connect').textContent = busy ? '连接中…' : row?.status === 'STOPPED' ? '启动并连接' : '一键连接';
@@ -55,6 +56,7 @@
       ? [row.project, row.group, row.restricted ? '此机器使用 Jupyter Terminal，不支持 SSH 隧道' : statusNames[row.status] || row.status].filter(Boolean).join(' · ')
       : '没有匹配的 Notebook';
     get('port').value = row?.localPort || '';
+    get('tunnel').value = row?.tunnelId || '';
     controls();
   }
   function render() {
@@ -73,6 +75,10 @@
     loading = true; error(''); rows = []; render();
     get('progress').textContent = '正在读取 Notebook…';
     try {
+      const local = await api('/api/tunnels');
+      if (current !== generation) return;
+      tunnels = local.tunnels || [];
+      get('tunnel').replaceChildren(new Option('自动识别', ''), ...tunnels.map(t => new Option(t.name + ' · ' + t.port, t.id)));
       const data = await api('/api/inspire/notebooks?' + query());
       if (current !== generation) return;
       rows = data.notebooks || [];
@@ -135,12 +141,16 @@
     const row = selection();
     if (!row || busy) return;
     if (get('port').value && !get('port').checkValidity()) { get('port').reportValidity(); return; }
+    const allowStart = row.status === 'STOPPED';
+    if (allowStart && !window.confirm('启动 Notebook “' + row.name + '”？这将占用平台计算资源。')) return;
     busy = true; controls(); error('');
     get('progress').textContent = '正在建立连接…';
     try {
       const data = await api('/api/inspire/connect', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ account: get('account').value, workspace: get('workspace').value, notebook: row.name, localPort: get('port').value }),
+        body: JSON.stringify({ account: get('account').value, workspace: get('workspace').value, notebook: row.name,
+          localPort: get('port').value, tunnelId: get('tunnel').value,
+          expectedPort: tunnels.find(t => t.id === get('tunnel').value)?.port ?? row.localPort, allowStart }),
       });
       job = data.job;
       get('port').value = job.localPort;
@@ -152,6 +162,10 @@
   get('reload').addEventListener('click', () => get('workspace').value ? loadNotebooks() : loadAccounts());
   get('search').addEventListener('input', render);
   get('notebook').addEventListener('change', details);
+  get('tunnel').addEventListener('change', () => {
+    const tunnel = tunnels.find(t => t.id === get('tunnel').value);
+    get('port').value = tunnel?.port || selection()?.localPort || '';
+  });
   get('close').addEventListener('click', close);
   get('dismiss').addEventListener('click', close);
   modal.addEventListener('click', e => { if (e.target === modal) close(); });
